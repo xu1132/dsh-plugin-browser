@@ -22,6 +22,8 @@ export const inject = ['tools']
 export interface Config {
   /** Path to a system browser executable. Omit to use Playwright's bundled chromium. */
   executablePath?: string
+  /** Playwright browser channel selecting an installed system browser (`chrome`, `msedge`, …). */
+  channel?: string
   /** Navigation/click/type timeout in milliseconds. */
   timeoutMs: number
   /** Cap on characters of extracted body text per snapshot. */
@@ -35,6 +37,7 @@ export interface Config {
 /** Schemastery schema validating {@link Config}; deployment-varying fields default here. */
 export const Config: z<Config> = z.object({
   executablePath: z.string(),
+  channel: z.string(),
   timeoutMs: z.number().default(30000),
   maxTextChars: z.number().default(20000),
   maxLinks: z.number().default(20),
@@ -59,6 +62,7 @@ export function apply(ctx: Context, config: Config): void {
   assertPositive('maxLinks', config.maxLinks)
   const manager = new BrowserSessionManager({
     ...(config.executablePath !== undefined ? { executablePath: config.executablePath } : {}),
+    ...(config.channel !== undefined ? { channel: config.channel } : {}),
     timeoutMs: config.timeoutMs,
     maxTextChars: config.maxTextChars,
     maxLinks: config.maxLinks,

@@ -17,12 +17,29 @@ Each agent gets its own isolated browser session; calls without an agent share a
 
 ## Install
 
-The plugin uses Playwright's bundled chromium by default. First-time setup installs the browser binary:
+Install the bundle into the profile that boots your harness:
 
 ```sh
-dsh plugin --profile demo add github:you/dsh-plugin-browser
-npx playwright install chromium   # from the profile directory
+dsh plugin --profile <name> add dsh-plugin-browser
 ```
+
+Then pick a browser. The plugin uses Playwright's bundled chromium by default, which means a one-time download of roughly 150 MB:
+
+```sh
+npx playwright install chromium   # run from the profile directory
+```
+
+**Already have Chrome or Edge?** Skip the download and point the plugin at the browser you have — either channel works on Windows, macOS, and Linux:
+
+```yaml
+# <profile>/cordis.patch.yml
+- id: browser
+  name: dsh-plugin-browser
+  config:
+    channel: chrome        # or: msedge
+```
+
+If no browser is reachable, the first browser tool call fails with a message naming both options, instead of Playwright's bare `Executable doesn't exist at …`.
 
 Then boot and ask the model, for example: *"Open https://example.com and tell me what's on the page."* The model calls `browser_navigate` and receives the rendered text.
 
@@ -38,10 +55,11 @@ Override the row in the profile's `cordis.patch.yml`:
     maxTextChars: 20000   # cap on extracted body text per snapshot
     maxLinks: 20          # cap on links listed per snapshot
     screenshotDir: .      # default directory for screenshots
+    channel: chrome       # Playwright channel: an installed system browser
     executablePath: /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
 ```
 
-`executablePath` points at a system browser instead of Playwright's bundled chromium — useful when you do not want the browser download.
+`channel` and `executablePath` both replace Playwright's bundled chromium with a browser you already have — useful when you do not want the browser download. Use `channel` for a stock Chrome/Edge install; use `executablePath` for a specific binary (a portable build, a beta channel, a non-standard install location). `executablePath` wins when both are set.
 
 ## Development
 
@@ -52,7 +70,7 @@ pnpm run build     # emits lib/index.js and lib/index.d.ts
 pnpm run test
 ```
 
-The test suite boots a local HTTP server and drives the **system Chrome** (skipped when Chrome is absent), so it needs no browser download and no real network. With Playwright's bundled chromium instead, install it once: `npx playwright install chromium`.
+The test suite boots a local HTTP server and drives the bundled chromium, or the installed Chrome/Edge when the bundle is absent; it skips itself when neither is available, so it needs no real network.
 
 ## Structure
 

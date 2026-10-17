@@ -7,7 +7,7 @@
  */
 
 import { Browser, BrowserContext, chromium, Page } from 'playwright'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -15,6 +15,8 @@ import { join } from 'node:path'
 export interface BrowserConfig {
   /** Path to a system browser executable. Omit to use Playwright's bundled chromium. */
   executablePath?: string
+  /** Playwright browser channel (`chrome`, `msedge`, …) selecting an installed system browser. */
+  channel?: string
   /** Navigation/click/type timeout in milliseconds. */
   timeoutMs: number
   /** Cap on characters of extracted body text per snapshot. */
@@ -50,6 +52,23 @@ export function formatSnapshot(snapshot: PageSnapshot): string {
 }
 
 /**
+ * Fail fast when the configured browser cannot exist, instead of surfacing
+ * Playwright's bare `Executable doesn't exist at …` from the first tool call.
+ * Only the bundled-chromium path is checked: `channel` and `executablePath`
+ * delegate resolution to Playwright, which reports its own errors.
+ */
+export function assertBrowserAvailable(config: BrowserConfig): void {
+  if (config.executablePath !== undefined || config.channel !== undefined) return
+  const bundled = chromium.executablePath()
+  if (existsSync(bundled)) return
+  throw new Error(
+    'browser-plugin: no browser available. Install Playwright\'s chromium '
+    + '(`npx playwright install chromium`), or point the plugin at a browser you already have: '
+    + 'set `channel: chrome` (or `msedge`), or `executablePath` to the browser binary.',
+  )
+}
+
+/**
  * One live headless browser session. Sessions are created lazily and closed
  * explicitly; the owning manager owns their lifecycle.
  */
@@ -70,8 +89,11 @@ export class BrowserSession {
 
   /** Launch a headless browser and open a fresh page. */
   static async create(config: BrowserConfig): Promise<BrowserSession> {
-    // A private HOME keeps the browser fully self-contained: profile, crashpad,
-    // and cache all land under this temp dir instead of the user's real profile.
+    assertBrowserAvailable(config)
+    // A private HOME keeps the browser fully self-contained on POSIX: profile,
+    // crashpad, and cache all land under this temp dir instead of the user's
+    // real profile. Windows resolves the profile from the Playwright-owned
+    // user-data-dir instead, which is already private per launch.
     const homeDir = mkdtempSync(join(tmpdir(), 'dsh-browser-'))
     const browser = await chromium.launch({
       headless: true,
@@ -85,6 +107,7 @@ export class BrowserSession {
         '--no-first-run',
         '--disable-background-networking',
       ],
+      ...(config.channel !== undefined ? { channel: config.channel } : {}),
       ...(config.executablePath !== undefined ? { executablePath: config.executablePath } : {}),
     })
     const context = await browser.newContext()
@@ -141,16 +164,26 @@ export class BrowserSession {
   }
 }
 
+/** One agent's session slot: the live session, plus any launch still in flight. */
+interface SessionSlot {
+  session?: BrowserSession
+  pending?: Promise<BrowserSession>
+}
+
 /**
  * Lazily-created per-agent browser sessions. An `exec.agent` key isolates one
  * session per agent; calls without an agent share a default session. Disposal
  * closes every live session so plugin unload never leaks a browser process.
+ *
+ * Session creation is single-flight per slot: the agent loop dispatches
+ * parallel tool calls, so two first calls arriving together must share one
+ * launch instead of racing into two browser processes.
  */
 export class BrowserSessionManager {
   private readonly config: BrowserConfig
-  private readonly sessions = new WeakMap<object, BrowserSession>()
+  private readonly slots = new WeakMap<object, SessionSlot>()
   private readonly live = new Set<BrowserSession>()
-  private defaultSession: BrowserSession | undefined
+  private readonly defaultSlot: SessionSlot = {}
 
   constructor(config: BrowserConfig) {
     this.config = config
@@ -158,27 +191,19 @@ export class BrowserSessionManager {
 
   /** Resolve (creating if needed) the session for one agent key. */
   async requireSession(key?: object): Promise<BrowserSession> {
-    if (key !== undefined) {
-      const existing = this.sessions.get(key)
-      if (existing !== undefined) return existing
-      const created = await this.createSession()
-      this.sessions.set(key, created)
-      return created
-    }
-    this.defaultSession ??= await this.createSession()
-    return this.defaultSession
+    return await this.resolve(this.slotFor(key))
   }
 
   /** Close the session for one agent key (or the default when key is absent). */
   async closeSession(key?: object): Promise<boolean> {
-    let session: BrowserSession | undefined
-    if (key !== undefined) {
-      session = this.sessions.get(key)
-      if (session !== undefined) this.sessions.delete(key)
-    } else {
-      session = this.defaultSession
-      this.defaultSession = undefined
-    }
+    const slot = key !== undefined ? this.slots.get(key) : this.defaultSlot
+    if (slot === undefined) return false
+    if (key !== undefined) this.slots.delete(key)
+    // A launch already in flight still owns a process: wait for it, then close
+    // that session, so a concurrent first call cannot resurrect the slot.
+    const session = slot.session
+      ?? (slot.pending !== undefined ? await slot.pending.catch(() => undefined) : undefined)
+    slot.session = undefined
     if (session === undefined) return false
     this.live.delete(session)
     await session.close()
@@ -189,8 +214,31 @@ export class BrowserSessionManager {
   async dispose(): Promise<void> {
     const sessions = [...this.live]
     this.live.clear()
-    this.defaultSession = undefined
+    this.defaultSlot.session = undefined
+    this.defaultSlot.pending = undefined
     await Promise.all(sessions.map(session => session.close()))
+  }
+
+  private slotFor(key?: object): SessionSlot {
+    if (key === undefined) return this.defaultSlot
+    let slot = this.slots.get(key)
+    if (slot === undefined) {
+      slot = {}
+      this.slots.set(key, slot)
+    }
+    return slot
+  }
+
+  private async resolve(slot: SessionSlot): Promise<BrowserSession> {
+    if (slot.session !== undefined) return slot.session
+    slot.pending ??= this.createSession()
+    try {
+      const session = await slot.pending
+      slot.session ??= session
+      return slot.session
+    } finally {
+      slot.pending = undefined
+    }
   }
 
   private async createSession(): Promise<BrowserSession> {

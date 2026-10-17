@@ -1,26 +1,23 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AddressInfo } from 'node:net'
 import { Context } from '@deepseek-ai/cordis'
-import { CallId } from '@deepseek-ai/dsh-llm'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { chromium } from 'playwright'
 import { apply, Config, inject, name } from '../src/index.ts'
+import { assertBrowserAvailable, BrowserSession, BrowserSessionManager } from '../src/session.ts'
 
 // Prefer Playwright's bundled chromium (the real user path, installed with
-// `playwright install chromium`); fall back to the system Chrome; skip the
-// suite when neither is available.
-const SYSTEM_CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+// `playwright install chromium`); fall back to a system Chrome/Edge channel;
+// skip the suite when neither is available.
 const bundledPath = chromium.executablePath()
-const executablePath = existsSync(bundledPath)
-  ? undefined
-  : existsSync(SYSTEM_CHROME)
-    ? SYSTEM_CHROME
-    : undefined
+const bundled = existsSync(bundledPath)
+const channel = bundled ? undefined : 'chrome'
 
 const testSignal = new AbortController().signal
 
@@ -32,7 +29,7 @@ let server: Server
 let base: string
 let SHOT_DIR: string
 
-describe.skipIf(executablePath === undefined && !existsSync(bundledPath))('dsh-plugin-browser', () => {
+describe.skipIf(!bundled && channel === undefined)('dsh-plugin-browser', () => {
   beforeAll(async () => {
     SHOT_DIR = mkdtempSync(join(tmpdir(), 'dsh-browser-'))
     server = createServer((req, res) => {
@@ -65,7 +62,7 @@ describe.skipIf(executablePath === undefined && !existsSync(bundledPath))('dsh-p
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
     fiber = await ctx.plugin({ name, inject, Config, apply }, {
-      ...(executablePath !== undefined ? { executablePath } : {}),
+      ...(channel !== undefined ? { channel } : {}),
       timeoutMs: 15000,
       maxTextChars: 20000,
       maxLinks: 20,
@@ -84,7 +81,7 @@ describe.skipIf(executablePath === undefined && !existsSync(bundledPath))('dsh-p
   it('navigates a URL and returns its rendered text and links', async () => {
     const result = await ctx!.tools.execute({
       signal: testSignal,
-      callId: CallId('c1'),
+      callId: ToolCallId('c1'),
       name: 'browser_navigate',
       arguments: { url: base },
     })
@@ -98,14 +95,14 @@ describe.skipIf(executablePath === undefined && !existsSync(bundledPath))('dsh-p
   it('clicks a link and reflects the new page', async () => {
     const clicked = await ctx!.tools.execute({
       signal: testSignal,
-      callId: CallId('c2'),
+      callId: ToolCallId('c2'),
       name: 'browser_click',
       arguments: { selector: 'a[href="/about"]' },
     })
     expect(clicked.isError).toBe(false)
     const snapshot = await ctx!.tools.execute({
       signal: testSignal,
-      callId: CallId('c3'),
+      callId: ToolCallId('c3'),
       name: 'browser_snapshot',
       arguments: {},
     })
@@ -117,27 +114,27 @@ describe.skipIf(executablePath === undefined && !existsSync(bundledPath))('dsh-p
   it('fills a form and submits it', async () => {
     await ctx!.tools.execute({
       signal: testSignal,
-      callId: CallId('c4'),
+      callId: ToolCallId('c4'),
       name: 'browser_navigate',
       arguments: { url: `${base}/form` },
     })
     const typed = await ctx!.tools.execute({
       signal: testSignal,
-      callId: CallId('c5'),
+      callId: ToolCallId('c5'),
       name: 'browser_type',
       arguments: { selector: '#name', text: 'Ada' },
     })
     expect(typed.isError).toBe(false)
     const submitted = await ctx!.tools.execute({
       signal: testSignal,
-      callId: CallId('c6'),
+      callId: ToolCallId('c6'),
       name: 'browser_click',
       arguments: { selector: '#submit' },
     })
     expect(submitted.isError).toBe(false)
     const snapshot = await ctx!.tools.execute({
       signal: testSignal,
-      callId: CallId('c7'),
+      callId: ToolCallId('c7'),
       name: 'browser_snapshot',
       arguments: {},
     })
@@ -147,7 +144,7 @@ describe.skipIf(executablePath === undefined && !existsSync(bundledPath))('dsh-p
   it('saves a non-empty screenshot', async () => {
     const shot = await ctx!.tools.execute({
       signal: testSignal,
-      callId: CallId('c8'),
+      callId: ToolCallId('c8'),
       name: 'browser_screenshot',
       arguments: {},
     })
@@ -160,7 +157,7 @@ describe.skipIf(executablePath === undefined && !existsSync(bundledPath))('dsh-p
   it('closes the session and starts a fresh one', async () => {
     const closed = await ctx!.tools.execute({
       signal: testSignal,
-      callId: CallId('c9'),
+      callId: ToolCallId('c9'),
       name: 'browser_close',
       arguments: {},
     })
@@ -168,11 +165,88 @@ describe.skipIf(executablePath === undefined && !existsSync(bundledPath))('dsh-p
     expect((closed.value as { message: string }).message).toBe('browser session closed')
     const reopened = await ctx!.tools.execute({
       signal: testSignal,
-      callId: CallId('c10'),
+      callId: ToolCallId('c10'),
       name: 'browser_navigate',
       arguments: { url: base },
     })
     expect(reopened.isError).toBe(false)
     expect((reopened.value as { title: string }).title).toBe('Home')
+  })
+})
+
+describe('BrowserSessionManager', () => {
+  // The agent loop dispatches parallel tool calls, so two first calls can
+  // arrive together. They must share one launch: two browsers would double
+  // the process count and leave the loser unreachable through closeSession.
+  it('shares one launch across concurrent first calls', async () => {
+    const manager = new BrowserSessionManager({
+      timeoutMs: 1000,
+      maxTextChars: 100,
+      maxLinks: 1,
+    })
+    let launches = 0
+    let closed = 0
+    const fake = { close: async () => { closed += 1 } } as unknown as BrowserSession
+    const spy = vi.spyOn(BrowserSession, 'create').mockImplementation(async () => {
+      launches += 1
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      return fake
+    })
+
+    const [first, second] = await Promise.all([
+      manager.requireSession(),
+      manager.requireSession(),
+    ])
+    expect(launches).toBe(1)
+    expect(first).toBe(second)
+
+    expect(await manager.closeSession()).toBe(true)
+    expect(closed).toBe(1)
+    expect(await manager.closeSession()).toBe(false)
+
+    spy.mockRestore()
+    await manager.dispose()
+  })
+
+  // A close that races an in-flight launch must still shut that browser down
+  // instead of dropping the handle.
+  it('closes a session whose launch was still in flight', async () => {
+    const manager = new BrowserSessionManager({
+      timeoutMs: 1000,
+      maxTextChars: 100,
+      maxLinks: 1,
+    })
+    let closed = 0
+    const fake = { close: async () => { closed += 1 } } as unknown as BrowserSession
+    const spy = vi.spyOn(BrowserSession, 'create').mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      return fake
+    })
+
+    const pending = manager.requireSession()
+    expect(await manager.closeSession()).toBe(true)
+    await pending
+    expect(closed).toBe(1)
+
+    spy.mockRestore()
+    await manager.dispose()
+  })
+})
+
+describe('assertBrowserAvailable', () => {
+  // A missing browser is a setup mistake the user can fix from the message
+  // alone, so it must not surface as Playwright's bare path error.
+  it('names both remedies when no browser is reachable', () => {
+    const spy = vi.spyOn(chromium, 'executablePath').mockReturnValue('/nonexistent/chrome')
+    expect(() => assertBrowserAvailable({ timeoutMs: 1000, maxTextChars: 100, maxLinks: 1 }))
+      .toThrow(/playwright install chromium[\s\S]*channel: chrome/)
+    spy.mockRestore()
+  })
+
+  it('accepts an explicit channel without checking the bundle', () => {
+    const spy = vi.spyOn(chromium, 'executablePath').mockReturnValue('/nonexistent/chrome')
+    expect(() => assertBrowserAvailable({ channel: 'chrome', timeoutMs: 1000, maxTextChars: 100, maxLinks: 1 }))
+      .not.toThrow()
+    spy.mockRestore()
   })
 })
